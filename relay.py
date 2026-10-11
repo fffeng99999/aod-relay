@@ -80,19 +80,13 @@ def _status_html(state):
         "<tr><td>版本</td><td class=v>" + RELAY_VERSION + "</td></tr>"
         "<tr><td>lines 协议</td><td class=v>" + lines_proto + "</td></tr>"
         "<tr><td>启动时间</td><td class=v>" + state.started_at + "</td></tr>"
-        "<tr><td>监听端口</td><td class=v>" + str(state.port) + "</td></tr>"
-        "<tr><td>hub 地址</td><td class=v>" + (state.hub_url if not mock else "—（mock）") + "</td></tr>"
         "<tr><td>mock</td><td class=v>"
         + ("<span class=warn>开启" + ("，fail=" + mock_fail if mock_fail else "") + "</span>" if mock else "关闭")
         + "</td></tr>"
         "<tr><td>缺价容错</td><td class=v>"
         + ("<span class=ok>开启</span>" if cost_ignore else "关闭")
         + "</td></tr>"
-        "</table>"
-        "<p style='margin-top:16px;font-size:12px;color:#8b949e'>"
-        "接口：<code>GET /aod/usage?range=today|week|month</code>（Bearer 令牌）· "
-        "<code>GET /aod/health</code>（无鉴权）</p>"
-        "</div></body></html>"
+        "</table></div></body></html>"
     )
 
 
