@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PLACEHOLDER = "__REPLACE_ME__"
-RELAY_VERSION = "0.2"
+RELAY_VERSION = "0.3"
 DEFAULT_PORT = 8790
 FAIL_MARK = "❌"
 CORE_NUMERIC_FIELDS = ("total_tokens", "prompt_tokens", "completion_tokens",
@@ -231,11 +231,11 @@ def _disp_money(values, failed, name):
     return "¥" + FAIL_MARK if name in failed else fmt_money(values.get(name))
 
 
-def build_text(values, failed, range_key):
+def build_lines(values, failed, range_key):
     label = RANGE_LABEL.get(str(range_key or "").strip().lower(), "用量")
-    lines = ["%s %s tok｜%s" % (
+    lines = [{"id": "today", "text": "%s %s tok｜%s" % (
         label, _disp_tokens(values, failed, "total_tokens"),
-        _disp_money(values, failed, "cost_cny"))]
+        _disp_money(values, failed, "cost_cny"))}]
     # 本周 / 本月：快照里带了才输出（mock 会带）；读取失败时也送出 ❌ 行
     for key, name in (("week", "本周"), ("month", "本月")):
         total_name = key + "_total_tokens"
@@ -244,22 +244,27 @@ def build_text(values, failed, range_key):
             continue
         total = values.get(total_name) or 0
         if total > 0 or total_name in failed or cost_name in failed:
-            lines.append("%s %s tok｜%s" % (
+            lines.append({"id": key, "text": "%s %s tok｜%s" % (
                 name, _disp_tokens(values, failed, total_name),
-                _disp_money(values, failed, cost_name)))
-    lines.append("请求 %s｜错误 %s" % (
-        _disp_int(values, failed, "requests"), _disp_int(values, failed, "errors")))
+                _disp_money(values, failed, cost_name))})
+    lines.append({"id": "requests", "text": "请求 %s｜错误 %s" % (
+        _disp_int(values, failed, "requests"), _disp_int(values, failed, "errors"))})
     prompt = values.get("prompt_tokens") or 0
     completion = values.get("completion_tokens") or 0
     if (prompt > 0 or completion > 0
             or "prompt_tokens" in failed or "completion_tokens" in failed):
-        lines.append("输入 %s｜输出 %s" % (
+        lines.append({"id": "io", "text": "输入 %s｜输出 %s" % (
             _disp_tokens(values, failed, "prompt_tokens"),
-            _disp_tokens(values, failed, "completion_tokens")))
+            _disp_tokens(values, failed, "completion_tokens"))})
     cached = values.get("cached_tokens") or 0
     if cached > 0 or "cached_tokens" in failed:
-        lines.append("缓存命中 %s" % _disp_tokens(values, failed, "cached_tokens"))
-    return "\n".join(lines)
+        lines.append({"id": "cache", "text": "缓存命中 %s"
+                      % _disp_tokens(values, failed, "cached_tokens")})
+    return lines
+
+
+def build_text(values, failed, range_key):
+    return "\n".join(str(line["text"]) for line in build_lines(values, failed, range_key))
 
 
 def build_payload(snapshot, range_key, source, cached=False, stale=False,
@@ -274,6 +279,7 @@ def build_payload(snapshot, range_key, source, cached=False, stale=False,
         "stale": stale,
         "range": range_key,
         "text": build_text(values, failed, range_key),
+        "lines": build_lines(values, failed, range_key),
         "total_tokens": values.get("total_tokens"),
         "prompt_tokens": values.get("prompt_tokens"),
         "completion_tokens": values.get("completion_tokens"),

@@ -183,6 +183,23 @@ def main():
     failures += 0 if ok else 1
     mock_hub.FAIL_FIELDS[:] = []
 
+    # relay 实例 6（mock）：lines 数组存在且与 text 一致（v0.3 协议）
+    port6 = free_port()
+    p6 = start_relay(["--port", str(port6), "--mock", "--relay-token", RELAY_TOKEN])
+    procs.append(p6)
+    wait_ready(port6, p6)
+    status, _h, body = http_get("http://127.0.0.1:%d/aod/usage" % port6,
+                                {"Authorization": "Bearer " + RELAY_TOKEN})
+    payload = json.loads(body) if body else {}
+    lines = payload.get("lines") or []
+    ids = [l.get("id") for l in lines]
+    joined = "\n".join(l.get("text", "") for l in lines)
+    ok = (status == 200
+          and "today" in ids and "requests" in ids
+          and joined == (payload.get("text") or ""))
+    print("[10] lines 协议      %s  ids=%s" % ("PASS" if ok else "FAIL", ids))
+    failures += 0 if ok else 1
+
     for proc in procs:
         proc.terminate()
     for proc in procs:
