@@ -1,0 +1,92 @@
+name: docker
+
+# 构建并推送镜像到 GitHub Container Registry（GHCR）：
+#   ghcr.io/<owner>/aod-relay:latest        默认分支每次推送自动更新
+#   ghcr.io/<owner>/aod-relay:<X.Y.Z>       打 v* 标签时
+#   ghcr.io/<owner>/aod-relay:sha-<短sha>   每次提交
+# GHCR 对公开仓库免费；镜像设为 public 后，任意联网机器可直接 docker pull。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 自测（取数层 + 中转）
+        run: |
+          python3 --version
+          python3 selftest.py
+          python3 selftest_relay.py
+
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 起容器冒烟测试（不推送）
+        run: |
+          set -euxo pipefail
+          docker build -t aod-relay:ci .
+          docker run -d --name aod-relay-ci -p 8790:8790 \
+            -e WB_PANEL_PASSWORD=mock-pass \
+            -e AOD_RELAY_TOKEN=devtoken123 \
+            aod-relay:ci
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8790/aod/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8790/aod/health
+          # 无令牌 -> 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/aod/usage)" = "401"
+          # 有令牌但 hub 不可达 -> 502 kind=net
+          code=$(curl -s -o /tmp/usage.json -w '%{http_code}' \
+            -H "Authorization: Bearer devtoken123" \
+            "http://127.0.0.1:8790/aod/usage?range=today")
+          cat /tmp/usage.json; echo
+          test "$code" = "502"
+          grep -q '"kind": *"net"' /tmp/usage.json
+          docker logs aod-relay-ci
+          docker rm -f aod-relay-ci
+
+  build-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+      - name: 构建并推送（amd64 + arm64）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false

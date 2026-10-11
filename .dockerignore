@@ -1,0 +1,9 @@
+.git/
+.github/
+.gitignore
+.gitattributes
+__pycache__/
+*.pyc
+dist/
+build/
+*.md

@@ -1,0 +1,38 @@
+# aod-relay 容器编排（部署在 hub 所在的服务器上）。
+#
+# 链路：手机 App --> 域名反向代理(HTTPS) --> 本容器 :8790 --> 本机 hub :8788
+#
+# 用法：
+#   1) 同目录建 .env（不要提交到 git）：
+#        WB_PANEL_PASSWORD=hub 面板密码
+#        AOD_RELAY_TOKEN=给手机的长随机令牌
+#   2) docker compose up -d --build
+#   3) 自测：
+#        curl -s http://127.0.0.1:8790/aod/health
+#        curl -s -H "Authorization: Bearer <令牌>" "http://127.0.0.1:8790/aod/usage?range=today"
+#
+# 网络默认 network_mode: host —— 与同一台服务器上的 hub 直接走本地回环
+# （hub 无论跑在宿主机进程、还是 Docker 把 8788 映射到宿主机，回环都通），
+# 反代也只需转发到 127.0.0.1:8790。服务器不便用 host 网络时，改用文件末尾
+# 注释里的 bridge 方案。
+services:
+  aod-relay:
+    build: .
+    image: aod-relay:latest
+    container_name: aod-relay
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      AOD_RELAY_HOST: "0.0.0.0"
+      AOD_RELAY_PORT: "8790"
+      AOD_HUB_URL: "${AOD_HUB_URL:-http://127.0.0.1:8788}"
+      WB_PANEL_PASSWORD: "${WB_PANEL_PASSWORD:?请在 .env 里提供 hub 面板密码}"
+      AOD_RELAY_TOKEN: "${AOD_RELAY_TOKEN:?请在 .env 里提供手机侧令牌}"
+      # .env 里写 AOD_COST_IGNORE_MISSING=1 即开启：有模型缺价时不显示 ¥❌（按已定价部分展示）
+      AOD_COST_IGNORE_MISSING: "${AOD_COST_IGNORE_MISSING:-}"
+    # ---- bridge 网络替代方案（启用时删掉上面的 network_mode: host）----
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    # ports:
+    #   - "8790:8790"
+    # 并把 AOD_HUB_URL 改为 http://host.docker.internal:8788

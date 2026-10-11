@@ -1,0 +1,22 @@
+# 镜像版编排：直接拉取 GitHub 上构建好的镜像（ghcr.io），更新最快（pull 即更新）。
+#
+# 一次性准备：
+#   1) 本文件与 .env 放同一目录（.env 见 .env.example，不要提交到 git）；
+#   2) 需要覆盖镜像时在 .env 里写 AOD_IMAGE=ghcr.io/<用户名>/aod-relay:<标签>。
+# 更新：
+#   docker compose -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.ghcr.yml up -d
+services:
+  aod-relay:
+    image: ${AOD_IMAGE:-ghcr.io/fffeng99999/aod-relay:latest}
+    container_name: aod-relay
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      AOD_RELAY_HOST: "0.0.0.0"
+      AOD_RELAY_PORT: "8790"
+      AOD_HUB_URL: "${AOD_HUB_URL:-http://127.0.0.1:8788}"
+      WB_PANEL_PASSWORD: "${WB_PANEL_PASSWORD:?请在 .env 里提供 hub 面板密码}"
+      AOD_RELAY_TOKEN: "${AOD_RELAY_TOKEN:?请在 .env 里提供手机侧令牌}"
+      # .env 里写 AOD_COST_IGNORE_MISSING=1 即开启：有模型缺价时不显示 ¥❌（按已定价部分展示）
+      AOD_COST_IGNORE_MISSING: "${AOD_COST_IGNORE_MISSING:-}"
