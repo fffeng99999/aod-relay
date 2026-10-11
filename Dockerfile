@@ -1,4 +1,4 @@
-# aod-relay v0.4.0 —— AOD 取数中转（workbuddy2api-hub 的本地边车）
+# aod-relay v0.4.1 —— AOD 取数中转（workbuddy2api-hub 的本地边车）
 #
 # 构建:  docker build -t aod-relay:latest .
 # 运行:  docker run -d --name aod-relay --restart unless-stopped --network host \
@@ -9,7 +9,7 @@
 FROM python:3.12-alpine
 
 LABEL org.opencontainers.image.title="aod-relay" \
-      org.opencontainers.image.version="0.4.0" \
+      org.opencontainers.image.version="0.4.1" \
       org.opencontainers.image.description="AOD 取数中转：手机 <- relay -> workbuddy2api-hub（本地链接）" \
       org.opencontainers.image.source="https://github.com/fffeng99999/aod-relay" \
       org.opencontainers.image.licenses="MIT"

@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 
 PLACEHOLDER = "__REPLACE_ME__"
-RELAY_VERSION = "0.4.0"
+RELAY_VERSION = "0.4.1"
 DEFAULT_PORT = 8790
 FAIL_MARK = "❌"
 USAGE_RANGES = ("today", "week", "month")
@@ -152,6 +152,31 @@ class HubClient(object):
                 payload.get("error"), dict) else payload.get("error")
             raise HubError("auth", "面板登录失败（HTTP %s）: %s" % (status, detail or "密码错误？"))
         self.token = payload["token"]
+
+    def accounts(self, realm=None):
+        """读 /accounts（面板同源账号列表：enabled/冷却/积分/realm）。"""
+        from urllib.parse import urlencode
+        with self._auth_lock:
+            if not self.token:
+                self.login()
+            used_token = self.token
+        query = "?" + urlencode({"realm": realm}) if realm else ""
+        status, _hdrs, raw = self._request(
+            "GET", "/accounts" + query, headers={"X-Panel-Token": used_token})
+        if status == 401:
+            with self._auth_lock:
+                if self.token == used_token:
+                    self.token = ""
+                    self.login()
+            return self.accounts(realm)
+        if status != 200:
+            payload = self._json_body(status, raw)
+            raise HubError("data", "取账号列表失败（HTTP %s）: %s" % (status, payload))
+        payload = self._json_body(status, raw)
+        accounts = payload.get("accounts") if isinstance(payload, dict) else None
+        if not isinstance(accounts, list):
+            raise HubError("data", "hub /accounts 缺少 accounts 列表")
+        return accounts
 
     def usage(self, range_key="today", realm="all", retry_auth=True):
         """读取 dashboard 使用的 /usage/analytics 日历窗口。"""
@@ -404,6 +429,65 @@ def combine_range_snapshots(snapshots):
     return combined
 
 
+def collect_credit_totals(accounts):
+    """按 realm 汇总各账号积分余额（credits.remain）；无积分数据的账号按 0 计。"""
+    totals = {"cn": 0.0, "intl": 0.0}
+    for account in accounts or []:
+        if not isinstance(account, dict):
+            continue
+        realm = str(account.get("realm") or "").strip().lower()
+        if realm not in totals:
+            continue
+        credits = account.get("credits")
+        remain = credits.get("remain") if isinstance(credits, dict) else None
+        try:
+            totals[realm] += float(remain or 0)
+        except (TypeError, ValueError):
+            pass
+    return {"cn": round(totals["cn"], 2), "intl": round(totals["intl"], 2)}
+
+
+def collect_disabled_accounts(accounts, now):
+    """提取被禁用的账号（enabled=false 或处于冷却中），供 App 侧表格展示。"""
+    disabled = []
+    for account in accounts or []:
+        if not isinstance(account, dict):
+            continue
+        enabled = account.get("enabled")
+        in_cooldown = bool(account.get("inCooldown"))
+        if enabled and not in_cooldown:
+            continue
+        try:
+            cooldown_for = int(account.get("cooldownFor") or 0)
+        except (TypeError, ValueError):
+            cooldown_for = 0
+        try:
+            expires_at = float(account.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        models = []
+        for entry in (account.get("modelCooldowns") or []):
+            if not isinstance(entry, dict):
+                continue
+            model = str(entry.get("model") or "")
+            if model:
+                models.append(model)
+        disabled.append({
+            "uid": str(account.get("uid") or ""),
+            "nickname": str(account.get("nickname") or ""),
+            "realm": str(account.get("realm") or ""),
+            "enabled": bool(enabled),
+            "inCooldown": in_cooldown,
+            "cooldownFor": cooldown_for,
+            "lastError": str(account.get("lastError") or ""),
+            "expiresAt": int(expires_at),
+            "expiresIn": str(account.get("expiresIn") or ""),
+            "cooldownModels": models,
+        })
+    disabled.sort(key=lambda row: (row["realm"], -row["cooldownFor"]))
+    return disabled
+
+
 def mock_snapshot(range_key="today"):
     """内置 mock：30 秒一档，节律与 mock_hub.py 一致，便于观察数据变化。"""
     bucket = int(time.time() // 30)
@@ -433,6 +517,31 @@ def apply_mock_failures(snapshot, names):
         snapshot.pop(name, None)
 
 
+def mock_accounts():
+    """内置 mock 账号：覆盖启用/禁用/冷却/各 realm，供联调与自测。"""
+    return [
+        {"uid": "cn-a1", "nickname": "国内一号", "realm": "cn", "enabled": True,
+         "inCooldown": False, "cooldownFor": 0, "lastError": "",
+         "expiresAt": int(time.time()) + 86400, "expiresIn": "24h",
+         "modelCooldowns": [], "credits": {"remain": 1280.5}},
+        {"uid": "cn-a2", "nickname": "国内二号", "realm": "cn", "enabled": False,
+         "inCooldown": False, "cooldownFor": 0,
+         "lastError": "disabled by upstream",
+         "expiresAt": int(time.time()) + 3600, "expiresIn": "1h",
+         "modelCooldowns": [], "credits": None},
+        {"uid": "intl-b1", "nickname": "国际一号", "realm": "intl", "enabled": True,
+         "inCooldown": True, "cooldownFor": 245,
+         "lastError": "429 rate limited",
+         "expiresAt": int(time.time()) + 7200, "expiresIn": "2h",
+         "modelCooldowns": [{"model": "deepseek-v4.1-flash", "expiresAt": 0}],
+         "credits": {"remain": 320.0}},
+        {"uid": "intl-b2", "nickname": "国际二号", "realm": "intl", "enabled": True,
+         "inCooldown": False, "cooldownFor": 0, "lastError": "",
+         "expiresAt": int(time.time()) + 172800, "expiresIn": "48h",
+         "modelCooldowns": [], "credits": {"remain": 12.75}},
+    ]
+
+
 class RelayState(object):
     """缓存放这里：手机分钟级轮询命中缓存就不打 hub；hub 挂了还能发旧数据兜底。"""
 
@@ -451,6 +560,29 @@ class RelayState(object):
         self.lock = threading.Lock()
         self._cache = {}      # (realm) -> (payload, built_at)
         self._last_good = {}  # realm -> (snapshots by range, fetched_at)
+        self._accounts_cache = {}  # realm -> (payload, built_at)
+
+    def get_accounts(self, realm):
+        """账号积分合计 + 禁用列表（App 内表格专用；不进 AOD 文本）。"""
+        now = time.time()
+        cache_key = realm or "all"
+        cached = self._accounts_cache.get(cache_key)
+        if cached is not None and now - cached[1] < self.cache_ttl:
+            return dict(cached[0])
+        if self.mock:
+            accounts = mock_accounts()
+        else:
+            accounts = self.hub.accounts(cache_key if cache_key != "all" else None)
+        payload = {
+            "ok": True,
+            "service": "aod-relay",
+            "version": RELAY_VERSION,
+            "credits": collect_credit_totals(accounts),
+            "disabled_accounts": collect_disabled_accounts(accounts, now),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self._accounts_cache[cache_key] = (payload, now)
+        return payload
 
     def get_payload(self, range_key, realm):
         now = time.time()
@@ -459,8 +591,12 @@ class RelayState(object):
             for snapshot in snapshots.values():
                 apply_mock_failures(snapshot, self.mock_fail)
             snapshot = combine_range_snapshots(snapshots)
-            return build_payload(snapshot, "all", "mock",
-                                 cost_ignore_missing=self.cost_ignore_missing)
+            payload = build_payload(snapshot, "all", "mock",
+                                    cost_ignore_missing=self.cost_ignore_missing)
+            payload["credits"] = collect_credit_totals(mock_accounts())
+            payload["disabled_accounts"] = collect_disabled_accounts(
+                mock_accounts(), now)
+            return payload
         with self.lock:
             cache_key = realm or "all"
             if cache_key in self._cache:
@@ -491,8 +627,21 @@ class RelayState(object):
                             range_failures[period] = str(period_error)
                             snapshots[period] = previous.get(period, {})
                 combined = combine_range_snapshots(snapshots)
+                accounts = None
+                accounts_error = ""
+                try:
+                    accounts = self.hub.accounts(cache_key if cache_key != "all" else None)
+                except HubError as account_error:
+                    accounts_error = str(account_error)
                 payload = build_payload(combined, "all", "hub",
                                         cost_ignore_missing=self.cost_ignore_missing)
+                if accounts is not None:
+                    payload["credits"] = collect_credit_totals(accounts)
+                    payload["disabled_accounts"] = collect_disabled_accounts(accounts, now)
+                else:
+                    payload["credits"] = {"cn": None, "intl": None}
+                    payload["disabled_accounts"] = []
+                    payload["accounts_error"] = accounts_error
                 if range_failures:
                     for period, reason in range_failures.items():
                         prefix = "" if period == "today" else period + "_"
@@ -574,10 +723,22 @@ def create_handler(state, relay_token, handler_cls=BaseHTTPRequestHandler):
                     "mock_fail": list(state.mock_fail),
                     "cost_ignore_missing": state.cost_ignore_missing})
 
-            if path not in ("/aod/usage", "/aod/data"):
+            if path not in ("/aod/usage", "/aod/data", "/aod/accounts"):
                 return self._json(404, {"ok": False, "error": "not found"})
             if not self._token_ok(query):
                 return self._json(401, {"ok": False, "error": "invalid relay token"})
+
+            if path == "/aod/accounts":
+                realm = (query.get("realm") or [""])[0].strip().lower()
+                if realm not in ("", "intl", "cn", "all"):
+                    return self._json(400, {"ok": False, "error": "bad realm"})
+                try:
+                    account_payload = state.get_accounts(realm)
+                except HubError as err:
+                    return self._json(502, {
+                        "ok": False, "service": "aod-relay",
+                        "error": str(err), "kind": err.kind})
+                return self._json(200, account_payload)
 
             range_key = "all"
             if (query.get("range") or [""])[0].strip().lower() not in ("", "today", "week", "month", "all"):

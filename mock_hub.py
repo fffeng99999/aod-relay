@@ -93,10 +93,14 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "token": TOKEN, "using_default_password": False})
 
     def do_GET(self):
-        if self.path.split("?")[0] != "/usage/analytics":
-            return self._json(404, {"error": "not found"})
         if (self.headers.get("X-Panel-Token") or "").strip() != TOKEN:
             return self._json(401, {"error": {"message": "panel password required"}})
+        route = self.path.split("?")[0]
+        if route == "/accounts":
+            self._json(200, {"ok": True, "accounts": mock_accounts()})
+            return
+        if route != "/usage/analytics":
+            return self._json(404, {"error": "not found"})
         query = parse_qs(urlparse(self.path).query)
         range_key = (query.get("range") or ["today"])[0]
         self.requested_ranges.append(range_key)
@@ -118,6 +122,31 @@ class Handler(BaseHTTPRequestHandler):
             "keys": [],
         }
         self._json(200, payload, etag=etag)
+
+
+def mock_accounts():
+    now = int(time.time())
+    return [
+        {"uid": "cn-a1", "nickname": "国内一号", "realm": "cn", "enabled": True,
+         "inCooldown": False, "cooldownFor": 0, "lastError": "",
+         "expiresAt": now + 86400, "expiresIn": "24h",
+         "modelCooldowns": [], "credits": {"remain": 1280.5}},
+        {"uid": "cn-a2", "nickname": "国内二号", "realm": "cn", "enabled": False,
+         "inCooldown": False, "cooldownFor": 0,
+         "lastError": "disabled by upstream",
+         "expiresAt": now + 3600, "expiresIn": "1h",
+         "modelCooldowns": [], "credits": None},
+        {"uid": "intl-b1", "nickname": "国际一号", "realm": "intl", "enabled": True,
+         "inCooldown": True, "cooldownFor": 245,
+         "lastError": "429 rate limited",
+         "expiresAt": now + 7200, "expiresIn": "2h",
+         "modelCooldowns": [{"model": "deepseek-v4.1-flash", "expiresAt": 0}],
+         "credits": {"remain": 320.0}},
+        {"uid": "intl-b2", "nickname": "国际二号", "realm": "intl", "enabled": True,
+         "inCooldown": False, "cooldownFor": 0, "lastError": "",
+         "expiresAt": now + 172800, "expiresIn": "48h",
+         "modelCooldowns": [], "credits": {"remain": 12.75}},
+    ]
 
 
 def main():

@@ -210,6 +210,19 @@ def main():
     failures += 0 if ok else 1
     mock_hub.FAIL_FIELDS[:] = []
 
+    # 账号接口：积分合计 + 禁用列表（mock 数据：cn 1280.5、intl 332.75；禁用 2 个）。
+    status, _h, body = http_get("http://127.0.0.1:%d/aod/accounts" % port1,
+                                {"Authorization": "Bearer " + RELAY_TOKEN})
+    account_payload = json.loads(body) if status == 200 else {}
+    credits = account_payload.get("credits") or {}
+    disabled = account_payload.get("disabled_accounts") or []
+    ok = (status == 200 and credits.get("cn") == 1280.5
+          and credits.get("intl") == 332.75 and len(disabled) == 2
+          and all(row.get("uid") for row in disabled))
+    print("[10] 账号积分/禁用    %s  credits=%s disabled=%d" % (
+        "PASS" if ok else "FAIL", credits, len(disabled)))
+    failures += 0 if ok else 1
+
     # relay 实例 6（mock）：lines 数组与 text 一致，包含 v0.4 三个窗口。
     port6 = free_port()
     p6 = start_relay(["--port", str(port6), "--mock", "--relay-token", RELAY_TOKEN])
@@ -226,7 +239,7 @@ def main():
           and {"today", "week", "month", "requests", "io", "cache"}.issubset(ids)
           and {"today", "week", "month"}.issubset(ranges)
           and joined == (payload.get("text") or ""))
-    print("[10] lines + 分窗    %s  ids=%s" % ("PASS" if ok else "FAIL", ids))
+    print("[11] lines + 分窗    %s  ids=%s" % ("PASS" if ok else "FAIL", ids))
     failures += 0 if ok else 1
 
     for proc in procs:
