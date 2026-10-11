@@ -10,8 +10,8 @@ hub 的面板凭据与登录细节全部留在服务器本地，永不进入手�
 
 - 手机侧只持有专用令牌（`AOD_RELAY_TOKEN`），可随时轮换；
 - 中转与 hub 走服务器本地回环（`127.0.0.1`），hub 不对公网暴露；
-- 上游只做两件事：`POST /panel/login` 换 token、`GET /usage?range=...` 取快照（带 ETag/304 复用、401 自动重登）；
-- **字段级失败**：某个数据在 hub 侧取不到（字段缺失 / 数值异常 / 有模型缺价）时，该字段名进 JSON 的
+- 上游通过 `POST /panel/login` 换取面板会话，再并发读取 `/usage/analytics?realm=all&range=today|week|month`；每个窗口分别使用 ETag/304，401 时自动重登。数据直接取自 workbuddy2api-hub v1.6.20 dashboard 的 `summary.window`。
+- **字段级失败**：某个数据在 hub 侧取不到（字段缺失 / 数值异常）时，该字段名进 JSON 的
   `failed` 字典，文本输出与 AOD 对应位置显示 ❌，其余字段照常显示。
 
 ## 快速开始（服务器 · Docker）
@@ -62,7 +62,9 @@ curl -s -H "Authorization: Bearer <AOD_RELAY_TOKEN>" "http://127.0.0.1:8790/aod/
 | `AOD_RELAY_TOKEN` | ✅ | — | 给手机的专用令牌，长随机串：`python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `AOD_HUB_URL` | — | `http://127.0.0.1:8788` | hub 地址（中转与 hub 同机时保持回环） |
 | `AOD_RELAY_HOST` / `AOD_RELAY_PORT` | — | `0.0.0.0` / `8790` | 监听地址 / 端口 |
-| `AOD_COST_IGNORE_MISSING` | — | 关 | `1` = 有模型缺价时不把金额判为读取失败（不显示 ¥❌） |
+| `AOD_COST_IGNORE_MISSING` | — | 关 | 已定价模型的等价费用照常显示；此开关只兼容旧版 relay |
+
+`cost_cny` 是面板中“API 等价花费”的人民币合计，`usd_cny` 来自同一统计载荷的美元汇率；手机显示人民币/美元两种金额。`cost_missing` 只列出无价模型，不会屏蔽已计价模型的合计。
 
 命令行等价参数：`--host/--port/--hub-url/--panel-password/--relay-token/--cost-ignore-missing/--mock/--mock-fail`。
 
@@ -71,7 +73,7 @@ curl -s -H "Authorization: Bearer <AOD_RELAY_TOKEN>" "http://127.0.0.1:8790/aod/
 | 接口 | 说明 |
 |---|---|
 | `GET /aod/usage` | 精简 JSON（`text` + 各字段 + `failed`） |
-| `GET /aod/usage?range=today\|week\|month` | 指定区间（默认 today） |
+| `GET /aod/usage?range=today\|week\|month` | 兼容旧客户端；新协议单次返回三个窗口 |
 | `GET /aod/usage?format=text` | `text/plain` 一行短文本，便于浏览器 / curl 直测 |
 | `GET /aod/health` | 存活探测（**无鉴权**，供反代与容器健康检查） |
 

@@ -26,6 +26,7 @@ jobs:
           python3 --version
           python3 selftest.py
           python3 selftest_relay.py
+          python3 -m py_compile relay.py mock_hub.py selftest.py selftest_relay.py
 
   smoke:
     needs: test

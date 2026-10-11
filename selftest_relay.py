@@ -88,11 +88,30 @@ def main():
     ok = status == 200 and payload.get("ok") and payload.get("source") == "hub" and payload.get("text")
     print("[1] 真实模式取数    %s  %s" % ("PASS" if ok else "FAIL", payload.get("text") or body))
     failures += 0 if ok else 1
+    requested_ranges = set(mock_hub.Handler.requested_ranges)
+    ok = {"today", "week", "month"}.issubset(requested_ranges)
+    print("[1a] 分别读取三窗口  %s  ranges=%s" % ("PASS" if ok else "FAIL", sorted(requested_ranges)))
+    failures += 0 if ok else 1
 
     status, _h, body = http_get(base1, {"Authorization": "Bearer " + RELAY_TOKEN})
     payload2 = json.loads(body) if status == 200 else {}
     ok = status == 200 and payload2.get("cached") is True
     print("[2] 命中缓存        %s  cached=%s" % ("PASS" if ok else "FAIL", payload2.get("cached")))
+    failures += 0 if ok else 1
+
+    expected_fields = {
+        "week_total_tokens", "week_prompt_tokens", "week_completion_tokens",
+        "week_cached_tokens", "week_requests", "week_errors", "week_cost_cny",
+        "month_total_tokens", "month_prompt_tokens", "month_completion_tokens",
+        "month_cached_tokens", "month_requests", "month_errors", "month_cost_cny",
+    }
+    ok = (expected_fields.issubset(payload.keys())
+          and payload["week_total_tokens"] > payload["total_tokens"]
+          and payload["month_total_tokens"] > payload["week_total_tokens"]
+          and payload.get("usd_cny") == 7.2
+          and "￥" in payload["text"] and " / $" in payload["text"])
+    print("[2a] 本周/本月全字段 %s  missing=%s" % (
+        "PASS" if ok else "FAIL", sorted(expected_fields - set(payload.keys()))))
     failures += 0 if ok else 1
 
     status, _h, body = http_get(base1, {"Authorization": "Bearer wrong-token"})
@@ -129,7 +148,8 @@ def main():
     status, _h, body = http_get("http://127.0.0.1:%d/aod/usage" % port3,
                                 {"Authorization": "Bearer " + RELAY_TOKEN})
     payload = json.loads(body) if body else {}
-    ok = status == 200 and payload.get("source") == "mock" and payload.get("text")
+    ok = (status == 200 and payload.get("source") == "mock" and payload.get("text")
+          and payload.get("schema_version") == "2")
     print("[6] mock 模式取数   %s  %s" % ("PASS" if ok else "FAIL", payload.get("text") or body))
     failures += 0 if ok else 1
 
@@ -144,7 +164,7 @@ def main():
         "PASS" if ok else "FAIL", proc.stdout.strip() or proc.stderr.strip()))
     failures += 0 if ok else 1
 
-    # relay 实例 4：缺价（cost_missing）-> 金额位置显示 ¥❌
+    # cost_missing 不应抹掉面板上已定价模型的花费合计。
     mock_hub.FAIL_FIELDS[:] = ["cost_cny"]
     port4 = free_port()
     p4 = start_relay(["--port", str(port4),
@@ -157,13 +177,19 @@ def main():
                                 {"Authorization": "Bearer " + RELAY_TOKEN})
     payload = json.loads(body) if body else {}
     failed = payload.get("failed") or {}
-    ok = (status == 200 and "¥❌" in (payload.get("text") or "")
-          and "cost_cny" in failed)
-    print("[8] 缺价->¥❌        %s  failed=%s" % (
-        "PASS" if ok else "FAIL", failed.get("cost_cny")))
+    text = payload.get("text") or ""
+    ok = (status == 200 and "￥" in text and " / $" in text
+          and "￥❌" not in text and "cost_cny" not in failed
+          and (payload.get("cost_cny") or 0) > 0
+          and all(" / $" in line.get("text", "") for line in payload.get("lines", [])
+                  if line.get("id") in ("today", "week", "month")))
+    for currency_line in (line for line in (payload.get("lines") or []) if line.get("id") in ("today", "week", "month")):
+        ok = ok and " / $" in currency_line.get("text", "")
+    print("[8] 有价模型合计保留 %s  cost_cny=%s text=%s" % (
+        "PASS" if ok else "FAIL", payload.get("cost_cny"), text.splitlines()[0] if text else body))
     failures += 0 if ok else 1
 
-    # relay 实例 5：字段缺失 -> 对应位置显示 ❌
+    # 今日字段缺失时当日显示失败标记；周/月窗口保持独立。
     mock_hub.FAIL_FIELDS[:] = ["errors"]
     port5 = free_port()
     p5 = start_relay(["--port", str(port5),
@@ -176,14 +202,15 @@ def main():
                                 {"Authorization": "Bearer " + RELAY_TOKEN})
     payload = json.loads(body) if body else {}
     failed = payload.get("failed") or {}
-    ok = (status == 200 and "错误 ❌" in (payload.get("text") or "")
+    lines = {line.get("id"): line.get("text", "") for line in (payload.get("lines") or [])}
+    ok = (status == 200 and "❌" in lines.get("requests", "")
           and "errors" in failed)
-    print("[9] 缺字段->❌       %s  %s" % (
+    print("[9] 字段失败显示❌   %s  %s" % (
         "PASS" if ok else "FAIL", (payload.get("text") or "").replace("\n", " | ")))
     failures += 0 if ok else 1
     mock_hub.FAIL_FIELDS[:] = []
 
-    # relay 实例 6（mock）：lines 数组存在且与 text 一致（v0.3 协议）
+    # relay 实例 6（mock）：lines 数组与 text 一致，包含 v0.4 三个窗口。
     port6 = free_port()
     p6 = start_relay(["--port", str(port6), "--mock", "--relay-token", RELAY_TOKEN])
     procs.append(p6)
@@ -194,10 +221,12 @@ def main():
     lines = payload.get("lines") or []
     ids = [l.get("id") for l in lines]
     joined = "\n".join(l.get("text", "") for l in lines)
+    ranges = set(mock_hub.Handler.requested_ranges)
     ok = (status == 200
-          and "today" in ids and "requests" in ids
+          and {"today", "week", "month", "requests", "io", "cache"}.issubset(ids)
+          and {"today", "week", "month"}.issubset(ranges)
           and joined == (payload.get("text") or ""))
-    print("[10] lines 协议      %s  ids=%s" % ("PASS" if ok else "FAIL", ids))
+    print("[10] lines + 分窗    %s  ids=%s" % ("PASS" if ok else "FAIL", ids))
     failures += 0 if ok else 1
 
     for proc in procs:

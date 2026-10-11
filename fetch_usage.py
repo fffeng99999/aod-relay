@@ -106,7 +106,7 @@ class HubClient(object):
         headers = {"X-Panel-Token": self.token}
         if self._etag:
             headers["If-None-Match"] = self._etag
-        status, resp_headers, raw = self._request("GET", "/usage" + query, headers=headers)
+        status, resp_headers, raw = self._request("GET", "/usage/analytics" + query, headers=headers)
         if status == 304:
             return self._last_snapshot  # 数据未变，复用缓存
         if status == 401:
@@ -117,7 +117,13 @@ class HubClient(object):
         if status != 200:
             payload = self._json_body(status, raw)
             raise HubError("data", "取用量失败（HTTP %s）：%s" % (status, payload))
-        snapshot = self._json_body(status, raw)
+        payload = self._json_body(status, raw)
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        snapshot = summary.get("window") if isinstance(summary, dict) else None
+        if not isinstance(snapshot, dict):
+            raise HubError("data", "hub /usage/analytics 缺少 summary.window")
+        snapshot = dict(snapshot)
+        snapshot["usd_cny"] = payload.get("usd_cny")
         etag = resp_headers.get("ETag") or resp_headers.get("etag")
         self._etag = etag or ""
         self._last_snapshot = snapshot

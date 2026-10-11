@@ -18,5 +18,5 @@ services:
       AOD_HUB_URL: "${AOD_HUB_URL:-http://127.0.0.1:8788}"
       WB_PANEL_PASSWORD: "${WB_PANEL_PASSWORD:?请在 .env 里提供 hub 面板密码}"
       AOD_RELAY_TOKEN: "${AOD_RELAY_TOKEN:?请在 .env 里提供手机侧令牌}"
-      # .env 里写 AOD_COST_IGNORE_MISSING=1 即开启：有模型缺价时不显示 ¥❌（按已定价部分展示）
+      # 兼容旧选项；v0.4 始终显示 hub 返回的已定价金额合计。
       AOD_COST_IGNORE_MISSING: "${AOD_COST_IGNORE_MISSING:-}"

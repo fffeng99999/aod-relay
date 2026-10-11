@@ -3,7 +3,7 @@
 """workbuddy2api-hub 的本地 mock：只实现 AOD 链路用到的两条接口。
 
   POST /panel/login   {"password": ...}        -> {"ok": true, "token": ...}
-  GET  /usage?range=  X-Panel-Token / ETag     -> 用量快照（30 秒一档，便于观察 304）
+  GET  /usage/analytics?range=  X-Panel-Token / ETag -> 用量统计快照
 
 用途：在没有真实 hub 的环境里联调 fetch_usage.py、以及后续广播桥。
 用法：python mock_hub.py [--port 8799] [--password test123]
@@ -12,6 +12,7 @@
 import argparse
 import json
 import time
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PASSWORD = "test123"
@@ -21,36 +22,32 @@ TOKEN = "mock-token-abc"
 FAIL_FIELDS = []
 
 
-def snapshot():
+def snapshot(range_key="today"):
     """30 秒一档的假数据：同一档内 ETag 不变，命中 If-None-Match 回 304。"""
     bucket = bucket_key()
-    total = 128000 + (bucket % 97) * 5000
+    multipliers = {"today": 1, "week": 8, "month": 27}
+    total = (128000 + (bucket % 97) * 5000) * multipliers.get(range_key, 1)
     requests = 87 + bucket % 13
     data = {
         "requests": requests,
         "errors": bucket % 3,
         "prompt_tokens": int(total * 0.72),
         "completion_tokens": int(total * 0.28),
-        "reasoning_tokens": int(total * 0.05),
         "cached_tokens": int(total * 0.11),
         "total_tokens": total,
         "credit": 0.0,
         "cost_cny": round(total / 1000000.0 * 3.2, 2),
         "cost_missing": {},
-        "started": time.time(),
-        "since": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "log_file": "usage/usage.jsonl",
-        "realm": "intl",
+        "realm": "all",
         "usd_cny": 7.2,
-        "accounts_map": {},
-        "account": {"accounts": 2, "accounts_ready": 2},
-        "by_model": {},
+        "pricing_enabled": True,
+        "reasoning_tokens": int(total * 0.05),
     }
     return _apply_fail_fields(data)
 
 
 def _apply_fail_fields(data):
-    """cost_cny 用 cost_missing 表达（数值在但价缺），其余字段直接删键（数据缺）。"""
+    """模拟面板无价模型：保留合计中已定价金额，同时提供 cost_missing 标记。"""
     for name in list(FAIL_FIELDS):
         name = str(name or "").strip()
         if not name:
@@ -68,6 +65,8 @@ def bucket_key():
 
 
 class Handler(BaseHTTPRequestHandler):
+    requested_ranges = []
+
     def log_message(self, fmt, *args):
         print("[mock] %s %s" % (self.address_string(), fmt % args))
 
@@ -94,17 +93,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "token": TOKEN, "using_default_password": False})
 
     def do_GET(self):
-        if self.path.split("?")[0] not in ("/usage", "/v1/usage"):
+        if self.path.split("?")[0] != "/usage/analytics":
             return self._json(404, {"error": "not found"})
         if (self.headers.get("X-Panel-Token") or "").strip() != TOKEN:
             return self._json(401, {"error": {"message": "panel password required"}})
-        etag = '"mock-%d"' % bucket_key()
+        query = parse_qs(urlparse(self.path).query)
+        range_key = (query.get("range") or ["today"])[0]
+        self.requested_ranges.append(range_key)
+        etag = '"mock-analytics-%d-%s"' % (bucket_key(), range_key)
         if (self.headers.get("If-None-Match") or "") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
             self.end_headers()
             return
-        self._json(200, snapshot(), etag=etag)
+        snap = snapshot(range_key)
+        payload = {
+            "ok": True,
+            "window": {"since": 0, "until": None},
+            "realm": "all",
+            "usd_cny": 7.2,
+            "summary": {"window": snap, "all_time": snap},
+            "accounts": [],
+            "models": [],
+            "keys": [],
+        }
+        self._json(200, payload, etag=etag)
 
 
 def main():

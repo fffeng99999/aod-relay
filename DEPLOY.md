@@ -70,8 +70,7 @@ curl -s http://127.0.0.1:8790/aod/health
 curl -s -H "Authorization: Bearer <AOD_RELAY_TOKEN>" "http://127.0.0.1:8790/aod/usage?range=today"
 ```
 
-预期：`ok:true`、`source:"hub"`，`text` 形如 `今日 12.3万 tok｜¥4.56`；
-某数据在 hub 侧读取失败时该字段进 `failed`，文本对应位置显示 ❌。
+预期：`ok:true`、`source:"hub"`，`lines` 同时包含今天、本周、本月窗口；花费以人民币和美元显示，并与面板「API 等价花费」使用同一统计源。单个字段读取失败时对应位置显示 ❌。
 
 ## 5. 域名反向代理
 
@@ -134,6 +133,6 @@ docker compose down              # 停止
 | 502 kind=net | hub 不可达：宿主机 `curl http://127.0.0.1:8788/health` 先通；hub 在 Docker 未映射端口时，把中转改为与 hub 同网络 |
 | 手机 401 | App 令牌与 `.env` 的 `AOD_RELAY_TOKEN` 不一致 |
 | 手机连不上域名 | 反代未指向 8790 / 改了路径前缀 / 防火墙 |
-| 金额长期 `¥❌` | hub 有模型缺价：看板「定价」页刷新；或 `.env` 加 `AOD_COST_IGNORE_MISSING=1` |
+| 金额显示 `￥❌ / $❌` | hub 未返回有效价格合计，或面板价格折算已关闭；确认面板「API 等价花费」已启用 |
 
 安全：公网只暴露反代（HTTPS）；令牌要轮换时改 `.env` 重启容器 + App 同步改。

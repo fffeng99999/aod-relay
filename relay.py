@@ -14,12 +14,12 @@
 
 上游（workbuddy2api-hub）:
   POST /panel/login  {"password": ...} -> token（内存缓存；401 自动重登）
-  GET  /usage?range=... 、Realm 过滤、ETag/If-None-Match -> 用量快照
+  GET  /usage/analytics?realm=all&range=today|week|month -> 面板使用的日历统计
 
 字段级失败（v0.2 起）:
-  某个数据在 hub 侧取不到（字段缺失 / 数值异常 / 有模型缺少价格）时，该字段名进
+  某个数据在 hub 侧取不到（字段缺失 / 数值异常）时，该字段名进
   JSON 的 "failed" 字典（值=原因），文本输出与 AOD 对应位置显示 ❌；
-  模型缺价默认算「金额读取失败」（显示 ¥❌），--cost-ignore-missing 可关掉这条。
+  模型缺价不会抹掉 hub 返回的已定价模型等价花费合计。
 
 占位凭据（部署时替换，或用环境变量注入）:
   AOD_HUB_URL=http://127.0.0.1:8788
@@ -36,6 +36,7 @@
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import sys
@@ -47,9 +48,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 
 PLACEHOLDER = "__REPLACE_ME__"
-RELAY_VERSION = "0.3.1"
+RELAY_VERSION = "0.4.0"
 DEFAULT_PORT = 8790
 FAIL_MARK = "❌"
+USAGE_RANGES = ("today", "week", "month")
 CORE_NUMERIC_FIELDS = ("total_tokens", "prompt_tokens", "completion_tokens",
                        "cached_tokens", "requests", "errors")
 
@@ -59,7 +61,7 @@ def _status_html(state):
     mock = bool(state.mock)
     mock_fail = ",".join(state.mock_fail)
     cost_ignore = bool(state.cost_ignore_missing)
-    lines_proto = "v0.3（lines=[{id,text},...]）"
+    lines_proto = "v0.4 面板统计分窗与双币价格"
     return (
         "<!doctype html><html lang=zh><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -111,7 +113,8 @@ class HubClient(object):
         self.password = password
         self.timeout = timeout
         self.token = ""
-        self._etag = ""
+        self._etags = {}
+        self._auth_lock = threading.Lock()
 
     def _request(self, method, path, body=None, headers=None):
         url = self.base + path
@@ -150,28 +153,43 @@ class HubClient(object):
             raise HubError("auth", "面板登录失败（HTTP %s）: %s" % (status, detail or "密码错误？"))
         self.token = payload["token"]
 
-    def usage(self, range_key="today", realm=""):
-        """取用量快照；304 时返回 None（调用方复用旧数据）。"""
-        if not self.token:
-            self.login()
-        query = "?range=" + range_key
-        if realm:
-            query += "&realm=" + realm
-        headers = {"X-Panel-Token": self.token}
-        if self._etag:
-            headers["If-None-Match"] = self._etag
-        status, resp_headers, raw = self._request("GET", "/usage" + query, headers=headers)
+    def usage(self, range_key="today", realm="all", retry_auth=True):
+        """读取 dashboard 使用的 /usage/analytics 日历窗口。"""
+        from urllib.parse import urlencode
+        with self._auth_lock:
+            if not self.token:
+                self.login()
+            used_token = self.token
+        cache_key = (range_key, realm)
+        query = "?" + urlencode({"range": range_key, "realm": realm})
+        headers = {"X-Panel-Token": used_token}
+        if self._etags.get(cache_key):
+            headers["If-None-Match"] = self._etags[cache_key]
+        status, resp_headers, raw = self._request("GET", "/usage/analytics" + query, headers=headers)
         if status == 304:
             return None
         if status == 401:
-            self.token = ""
-            self.login()
-            return self.usage(range_key, realm)
+            with self._auth_lock:
+                if self.token == used_token:
+                    self.token = ""
+                    self.login()
+            if retry_auth:
+                return self.usage(range_key, realm, retry_auth=False)
+            raise HubError("auth", "hub 面板会话刷新后仍未授权")
         if status != 200:
             payload = self._json_body(status, raw)
             raise HubError("data", "取用量失败（HTTP %s）: %s" % (status, payload))
-        snapshot = self._json_body(status, raw)
-        self._etag = resp_headers.get("ETag") or resp_headers.get("etag") or ""
+        payload = self._json_body(status, raw)
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        snapshot = summary.get("window") if isinstance(summary, dict) else None
+        if not isinstance(snapshot, dict):
+            raise HubError("data", "hub /usage/analytics 缺少 summary.window")
+        snapshot = dict(snapshot)
+        snapshot["usd_cny"] = payload.get("usd_cny")
+        snapshot["realm"] = payload.get("realm") or realm
+        if payload.get("pricing_enabled") is False:
+            snapshot["cost_cny"] = None
+        self._etags[cache_key] = resp_headers.get("ETag") or resp_headers.get("etag") or ""
         return snapshot
 
 
@@ -215,7 +233,7 @@ def _numeric_field(snapshot, name, failed):
 
 
 def _money_field(snapshot, name, failed, missing_models):
-    """取「金额型」字段；missing_models > 0 表示有模型没取到价格，一并算读取失败。"""
+    """解析 dashboard 窗口统计中的金额合计。"""
     if name not in snapshot or snapshot.get(name) is None:
         failed[name] = "字段缺失"
         return None
@@ -225,18 +243,13 @@ def _money_field(snapshot, name, failed, missing_models):
     except (TypeError, ValueError):
         failed[name] = "数值异常: %r" % (raw,)
         return None
-    if missing_models:
-        failed[name] = "%d 个模型缺少价格数据" % missing_models
-        return None
     return value
 
 
 def collect_fields(snapshot, cost_ignore_missing=False):
     """把 hub 快照解析成 (values, failed, missing_models)。
 
-    某个数据在 hub 侧取不到就进 failed —— 手机端对应位置显示 ❌，而不是把
-    0 / 缺字段静默当成真实数字。周 / 月聚合仅当快照里带了才解析（真实 hub
-    按 range 返回单窗口数据，不带这两个字段，不算失败）。
+    每个窗口前缀（today/week/month）独立解析；坏一个窗口不隐藏另外两个窗口。
     """
     failed = {}
     values = {}
@@ -246,13 +259,28 @@ def collect_fields(snapshot, cost_ignore_missing=False):
         missing_models = 0
     for name in CORE_NUMERIC_FIELDS:
         values[name] = _numeric_field(snapshot, name, failed)
-    values["cost_cny"] = _money_field(snapshot, "cost_cny", failed, missing_models)
-    for name in ("week_total_tokens", "month_total_tokens"):
-        if name in snapshot:
+    period_fields = ("total_tokens", "prompt_tokens", "completion_tokens",
+                     "cached_tokens", "requests", "errors")
+    for period in ("week", "month"):
+        for field in period_fields:
+            name = period + "_" + field
             values[name] = _numeric_field(snapshot, name, failed)
-    for name in ("week_cost_cny", "month_cost_cny"):
-        if name in snapshot:
-            values[name] = _money_field(snapshot, name, failed, missing_models)
+    # 与面板行为一致：cost_missing 描述部分模型无价，但合计展示已定价模型的累加值。
+    # cost_missing is per-model detail; the panel total is already the sum for priced models.
+    values["cost_cny"] = _money_field(snapshot, "cost_cny", failed, 0)
+    for period in ("week", "month"):
+        name = period + "_cost_cny"
+        values[name] = _money_field(snapshot, name, failed, 0)
+    for name in ("usd_cny", "week_usd_cny", "month_usd_cny"):
+        raw = snapshot.get(name) or snapshot.get("usd_cny")
+        try:
+            rate = float(raw)
+            if rate <= 0:
+                raise ValueError()
+            values[name] = rate
+        except (TypeError, ValueError):
+            failed[name] = "美元汇率缺失或无效"
+            values[name] = None
     return values, failed, missing_models
 
 
@@ -264,39 +292,50 @@ def _disp_int(values, failed, name):
     return FAIL_MARK if name in failed else str(_to_int(values.get(name)))
 
 
-def _disp_money(values, failed, name):
-    return "¥" + FAIL_MARK if name in failed else fmt_money(values.get(name))
+def _disp_money(values, failed, name, rate_name="usd_cny"):
+    if name in failed:
+        return "￥" + FAIL_MARK + " / $" + FAIL_MARK
+    try:
+        cny = float(values[name])
+    except (KeyError, TypeError, ValueError):
+        return "￥" + FAIL_MARK + " / $" + FAIL_MARK
+    rate = values.get(rate_name) or values.get("usd_cny")
+    if values.get(rate_name) is None:
+        return "￥%.2f / $%s" % (cny, FAIL_MARK)
+    try:
+        rate = float(rate)
+        if rate <= 0:
+            raise ValueError()
+        return "￥%.2f / $%.2f" % (cny, cny / rate)
+    except (TypeError, ValueError):
+        return "￥%.2f / $%s" % (cny, FAIL_MARK)
 
 
 def build_lines(values, failed, range_key):
-    label = RANGE_LABEL.get(str(range_key or "").strip().lower(), "用量")
-    lines = [{"id": "today", "text": "%s %s tok｜%s" % (
-        label, _disp_tokens(values, failed, "total_tokens"),
+    lines = [{"id": "today", "text": "今日 %s tok｜%s" % (
+        _disp_tokens(values, failed, "total_tokens"),
         _disp_money(values, failed, "cost_cny"))}]
-    # 本周 / 本月：快照里带了才输出（mock 会带）；读取失败时也送出 ❌ 行
     for key, name in (("week", "本周"), ("month", "本月")):
         total_name = key + "_total_tokens"
         cost_name = key + "_cost_cny"
-        if total_name not in values and cost_name not in values:
-            continue
-        total = values.get(total_name) or 0
-        if total > 0 or total_name in failed or cost_name in failed:
-            lines.append({"id": key, "text": "%s %s tok｜%s" % (
-                name, _disp_tokens(values, failed, total_name),
-                _disp_money(values, failed, cost_name))})
-    lines.append({"id": "requests", "text": "请求 %s｜错误 %s" % (
-        _disp_int(values, failed, "requests"), _disp_int(values, failed, "errors"))})
-    prompt = values.get("prompt_tokens") or 0
-    completion = values.get("completion_tokens") or 0
-    if (prompt > 0 or completion > 0
-            or "prompt_tokens" in failed or "completion_tokens" in failed):
-        lines.append({"id": "io", "text": "输入 %s｜输出 %s" % (
-            _disp_tokens(values, failed, "prompt_tokens"),
-            _disp_tokens(values, failed, "completion_tokens"))})
-    cached = values.get("cached_tokens") or 0
-    if cached > 0 or "cached_tokens" in failed:
-        lines.append({"id": "cache", "text": "缓存命中 %s"
-                      % _disp_tokens(values, failed, "cached_tokens")})
+        lines.append({"id": key, "text": "%s %s tok｜%s" % (
+            name, _disp_tokens(values, failed, total_name),
+            _disp_money(values, failed, cost_name, key + "_usd_cny"))})
+    lines.append({"id": "requests", "text": "请求 今/周/月 %s/%s/%s｜错误 %s/%s/%s" % (
+        _disp_int(values, failed, "requests"),
+        _disp_int(values, failed, "week_requests"),
+        _disp_int(values, failed, "month_requests"),
+        _disp_int(values, failed, "errors"),
+        _disp_int(values, failed, "week_errors"),
+        _disp_int(values, failed, "month_errors"))})
+    lines.append({"id": "io", "text": "输入 今/周/月 %s/%s/%s｜输出 %s/%s/%s" % (
+        _disp_tokens(values, failed, "prompt_tokens"), _disp_tokens(values, failed, "completion_tokens"),
+        _disp_tokens(values, failed, "week_prompt_tokens"), _disp_tokens(values, failed, "week_completion_tokens"),
+        _disp_tokens(values, failed, "month_prompt_tokens"), _disp_tokens(values, failed, "month_completion_tokens"))})
+    lines.append({"id": "cache", "text": "缓存命中 今/周/月 %s/%s/%s" % (
+        _disp_tokens(values, failed, "cached_tokens"),
+        _disp_tokens(values, failed, "week_cached_tokens"),
+        _disp_tokens(values, failed, "month_cached_tokens"))})
     return lines
 
 
@@ -315,6 +354,7 @@ def build_payload(snapshot, range_key, source, cached=False, stale=False,
         "cached": cached,
         "stale": stale,
         "range": range_key,
+        "schema_version": "2",
         "text": build_text(values, failed, range_key),
         "lines": build_lines(values, failed, range_key),
         "total_tokens": values.get("total_tokens"),
@@ -323,11 +363,24 @@ def build_payload(snapshot, range_key, source, cached=False, stale=False,
         "requests": values.get("requests"),
         "errors": values.get("errors"),
         "cost_cny": values.get("cost_cny"),
+        "usd_cny": values.get("usd_cny"),
         "cached_tokens": values.get("cached_tokens"),
         "week_total_tokens": values.get("week_total_tokens"),
+        "week_prompt_tokens": values.get("week_prompt_tokens"),
+        "week_completion_tokens": values.get("week_completion_tokens"),
+        "week_cached_tokens": values.get("week_cached_tokens"),
+        "week_requests": values.get("week_requests"),
+        "week_errors": values.get("week_errors"),
         "week_cost_cny": values.get("week_cost_cny"),
+        "week_usd_cny": values.get("week_usd_cny"),
         "month_total_tokens": values.get("month_total_tokens"),
+        "month_prompt_tokens": values.get("month_prompt_tokens"),
+        "month_completion_tokens": values.get("month_completion_tokens"),
+        "month_cached_tokens": values.get("month_cached_tokens"),
+        "month_requests": values.get("month_requests"),
+        "month_errors": values.get("month_errors"),
         "month_cost_cny": values.get("month_cost_cny"),
+        "month_usd_cny": values.get("month_usd_cny"),
         "failed": failed,
         "cost_missing_models": missing_models,
         "realm": snapshot.get("realm", ""),
@@ -336,12 +389,26 @@ def build_payload(snapshot, range_key, source, cached=False, stale=False,
     }
 
 
-def mock_snapshot():
+def combine_range_snapshots(snapshots):
+    """把 hub 分别按 today/week/month 返回的 analytics 窗口合成一份 AOD 数据。"""
+    today = snapshots.get("today") or {}
+    combined = dict(today)
+    combined["realm"] = "all"
+    fields = ("total_tokens", "prompt_tokens", "completion_tokens",
+              "cached_tokens", "requests", "errors", "cost_cny", "usd_cny")
+    for period in ("week", "month"):
+        snapshot = snapshots.get(period) or {}
+        for field in fields:
+            combined[period + "_" + field] = snapshot.get(field)
+        combined[period + "_cost_missing"] = snapshot.get("cost_missing")
+    return combined
+
+
+def mock_snapshot(range_key="today"):
     """内置 mock：30 秒一档，节律与 mock_hub.py 一致，便于观察数据变化。"""
     bucket = int(time.time() // 30)
-    total = 128000 + (bucket % 97) * 5000
-    week = int(total * 5.4) + 310000
-    month = int(total * 21.7) + 1250000
+    multiplier = {"today": 1, "week": 8, "month": 27}.get(range_key, 1)
+    total = (128000 + (bucket % 97) * 5000) * multiplier
     return {
         "total_tokens": total,
         "prompt_tokens": int(total * 0.72),
@@ -350,10 +417,7 @@ def mock_snapshot():
         "requests": 87 + bucket % 13,
         "errors": bucket % 3,
         "cost_cny": round(total / 1000000.0 * 3.2, 2),
-        "week_total_tokens": week,
-        "week_cost_cny": round(week / 1000000.0 * 3.2, 2),
-        "month_total_tokens": month,
-        "month_cost_cny": round(month / 1000000.0 * 3.2, 2),
+        "usd_cny": 7.2,
         "realm": "mock",
         "since": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -365,9 +429,6 @@ def apply_mock_failures(snapshot, names):
     for name in names:
         name = name.strip()
         if not name:
-            continue
-        if name == "cost_cny":
-            snapshot["cost_missing"] = {"mock-model": 3}
             continue
         snapshot.pop(name, None)
 
@@ -388,47 +449,76 @@ class RelayState(object):
         self.cost_ignore_missing = cost_ignore_missing
         self.mock_fail = tuple(mock_fail)
         self.lock = threading.Lock()
-        self._cache = None      # (payload, built_at)
-        self._last_good = None  # (snapshot, range_key, fetched_at)
+        self._cache = {}      # (realm) -> (payload, built_at)
+        self._last_good = {}  # realm -> (snapshots by range, fetched_at)
 
     def get_payload(self, range_key, realm):
         now = time.time()
         if self.mock:
-            snapshot = mock_snapshot()
-            apply_mock_failures(snapshot, self.mock_fail)
-            return build_payload(snapshot, range_key, "mock",
+            snapshots = {period: mock_snapshot(period) for period in USAGE_RANGES}
+            for snapshot in snapshots.values():
+                apply_mock_failures(snapshot, self.mock_fail)
+            snapshot = combine_range_snapshots(snapshots)
+            return build_payload(snapshot, "all", "mock",
                                  cost_ignore_missing=self.cost_ignore_missing)
         with self.lock:
-            if self._cache is not None:
-                payload, built_at = self._cache
-                if now - built_at < self.cache_ttl and payload.get("range") == range_key:
+            cache_key = realm or "all"
+            if cache_key in self._cache:
+                payload, built_at = self._cache[cache_key]
+                if now - built_at < self.cache_ttl:
                     payload = dict(payload)
                     payload["cached"] = True
                     return payload
             try:
-                snapshot = None
-                if self.hub is not None:
-                    snapshot = self.hub.usage(range_key, realm)
-                if snapshot is None:
-                    # 304：数据未变，复用上次快照
-                    if self._last_good is None:
-                        raise HubError("data", "hub 返回 304 但本服务尚无缓存快照")
-                    snapshot = self._last_good[0]
-                payload = build_payload(snapshot, range_key, "hub",
+                previous = self._last_good.get(cache_key, ({}, 0))[0]
+                snapshots = {}
+                range_failures = {}
+                with ThreadPoolExecutor(max_workers=len(USAGE_RANGES)) as executor:
+                    futures = {executor.submit(self.hub.usage, period, cache_key): period
+                               for period in USAGE_RANGES}
+                    for future in as_completed(futures):
+                        period = futures[future]
+                        try:
+                            snapshot = future.result()
+                            if snapshot is None:
+                                snapshot = previous.get(period)
+                                if snapshot is None:
+                                    raise HubError("data", "hub 对 %s 返回 304，但没有本地快照" % period)
+                            snapshots[period] = snapshot
+                        except HubError as period_error:
+                            if period == "today":
+                                raise period_error
+                            range_failures[period] = str(period_error)
+                            snapshots[period] = previous.get(period, {})
+                combined = combine_range_snapshots(snapshots)
+                payload = build_payload(combined, "all", "hub",
                                         cost_ignore_missing=self.cost_ignore_missing)
-                self._last_good = (snapshot, range_key, now)
-                self._cache = (payload, now)
+                if range_failures:
+                    for period, reason in range_failures.items():
+                        prefix = "" if period == "today" else period + "_"
+                        fields = ("total_tokens", "prompt_tokens", "completion_tokens",
+                                  "cached_tokens", "requests", "errors", "cost_cny")
+                        for field in fields:
+                            payload["failed"][prefix + field] = reason
+                    values, _existing, _missing = collect_fields(combined, self.cost_ignore_missing)
+                    payload["lines"] = build_lines(values, payload["failed"], "all")
+                    payload["text"] = "\n".join(line["text"] for line in payload["lines"])
+                self._last_good[cache_key] = (snapshots, now)
+                self._cache[cache_key] = (payload, now)
                 return payload
             except HubError as err:
-                if self._last_good is not None:
-                    snapshot, last_range, fetched_at = self._last_good
+                if cache_key in self._last_good:
+                    snapshots, fetched_at = self._last_good[cache_key]
                     if now - fetched_at <= self.stale_max:
+                        combined = combine_range_snapshots(snapshots)
                         payload = build_payload(
-                            snapshot, range_key, "hub", cached=True, stale=True,
+                            combined, "all", "hub", cached=True, stale=True,
                             cost_ignore_missing=self.cost_ignore_missing)
                         payload["stale_reason"] = str(err)
                         return payload
                 raise
+            except Exception as err:
+                raise HubError("net", "并发读取 hub 窗口失败: %s" % err)
 
 
 def create_handler(state, relay_token, handler_cls=BaseHTTPRequestHandler):
@@ -484,13 +574,13 @@ def create_handler(state, relay_token, handler_cls=BaseHTTPRequestHandler):
                     "mock_fail": list(state.mock_fail),
                     "cost_ignore_missing": state.cost_ignore_missing})
 
-            if path != "/aod/usage":
+            if path not in ("/aod/usage", "/aod/data"):
                 return self._json(404, {"ok": False, "error": "not found"})
             if not self._token_ok(query):
                 return self._json(401, {"ok": False, "error": "invalid relay token"})
 
-            range_key = (query.get("range") or ["today"])[0].strip().lower() or "today"
-            if range_key not in ("today", "week", "month", "all"):
+            range_key = "all"
+            if (query.get("range") or [""])[0].strip().lower() not in ("", "today", "week", "month", "all"):
                 return self._json(400, {"ok": False, "error": "bad range"})
             realm = (query.get("realm") or [""])[0].strip().lower()
             if realm not in ("", "intl", "cn", "all"):
@@ -539,8 +629,7 @@ def main(argv=None):
         print("[relay] mock 模式未提供 token，临时生成: %s" % relay_token)
     if not args.mock:
         if args.panel_password in ("", PLACEHOLDER):
-            print("[relay] 拒绝启动：请用 --panel-password 或 WB_PANEL_PASSWORD 填入 hub 面板密码"
-                  "（占位值 %s 不能用于真实模式）" % PLACEHOLDER, file=sys.stderr)
+            print("[relay] 拒绝启动：需要 panel 密码用于兼容方案", file=sys.stderr)
             return 2
         if relay_token in ("", PLACEHOLDER):
             print("[relay] 拒绝启动：请用 --relay-token 或 AOD_RELAY_TOKEN 设置手机侧令牌",
