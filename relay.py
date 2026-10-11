@@ -44,13 +44,56 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
 
 PLACEHOLDER = "__REPLACE_ME__"
-RELAY_VERSION = "0.3"
+RELAY_VERSION = "0.3.1"
 DEFAULT_PORT = 8790
 FAIL_MARK = "❌"
 CORE_NUMERIC_FIELDS = ("total_tokens", "prompt_tokens", "completion_tokens",
                        "cached_tokens", "requests", "errors")
+
+
+def _status_html(state):
+    """浏览器直接访问 /aod/（无鉴权）时的状态页：只暴露版本与运行信息，不含用量数据。"""
+    mock = bool(state.mock)
+    mock_fail = ",".join(state.mock_fail)
+    cost_ignore = bool(state.cost_ignore_missing)
+    lines_proto = "v0.3（lines=[{id,text},...]）"
+    return (
+        "<!doctype html><html lang=zh><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>aod-relay " + RELAY_VERSION + "</title>"
+        "<style>body{font-family:system-ui,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;"
+        "margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}"
+        ".card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:28px 36px;"
+        "min-width:320px;box-shadow:0 4px 16px rgba(0,0,0,.4)}"
+        "h1{margin:0 0 4px;font-size:22px;color:#58a6ff}"
+        "h1 small{font-size:14px;color:#8b949e;font-weight:400}"
+        "table{margin-top:14px;border-collapse:collapse;font-size:14px}"
+        "td{padding:5px 14px 5px 0;color:#8b949e}"
+        "td.v{color:#e6edf3;font-family:ui-monospace,Consolas,monospace}"
+        ".ok{color:#3fb950}.warn{color:#d29922}"
+        "</style></head><body><div class=card>"
+        "<h1>aod-relay <small>" + ("（mock 模式）" if mock else "") + "</small></h1>"
+        "<table>"
+        "<tr><td>版本</td><td class=v>" + RELAY_VERSION + "</td></tr>"
+        "<tr><td>lines 协议</td><td class=v>" + lines_proto + "</td></tr>"
+        "<tr><td>启动时间</td><td class=v>" + state.started_at + "</td></tr>"
+        "<tr><td>监听端口</td><td class=v>" + str(state.port) + "</td></tr>"
+        "<tr><td>hub 地址</td><td class=v>" + (state.hub_url if not mock else "—（mock）") + "</td></tr>"
+        "<tr><td>mock</td><td class=v>"
+        + ("<span class=warn>开启" + ("，fail=" + mock_fail if mock_fail else "") + "</span>" if mock else "关闭")
+        + "</td></tr>"
+        "<tr><td>缺价容错</td><td class=v>"
+        + ("<span class=ok>开启</span>" if cost_ignore else "关闭")
+        + "</td></tr>"
+        "</table>"
+        "<p style='margin-top:16px;font-size:12px;color:#8b949e'>"
+        "接口：<code>GET /aod/usage?range=today|week|month</code>（Bearer 令牌）· "
+        "<code>GET /aod/health</code>（无鉴权）</p>"
+        "</div></body></html>"
+    )
 
 
 class HubError(Exception):
@@ -341,6 +384,9 @@ class RelayState(object):
     def __init__(self, hub, mock=False, cache_ttl=30, stale_max=600, timeout=10,
                  cost_ignore_missing=False, mock_fail=()):
         self.hub = hub
+        self.hub_url = hub.base if hub is not None else ""
+        self.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.port = None
         self.mock = mock
         self.cache_ttl = cache_ttl
         self.stale_max = stale_max
@@ -427,6 +473,16 @@ def create_handler(state, relay_token, handler_cls=BaseHTTPRequestHandler):
             path = parsed.path
             query = parse_qs(parsed.query)
 
+            if path in ("/", "/aod", "/aod/"):
+                html = _status_html(state).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(html)
+                return
+
             if path == "/aod/health":
                 return self._json(200, {
                     "ok": True, "service": "aod-relay",
@@ -504,6 +560,7 @@ def main(argv=None):
                        mock_fail=[part for part in args.mock_fail.split(",") if part.strip()])
     handler = create_handler(state, relay_token)
     server = ThreadingHTTPServer((args.host, args.port), handler)
+    state.port = args.port
     print("[relay] listening on http://%s:%d  mode=%s  hub=%s" % (
         args.host, args.port, "mock" if args.mock else "hub", args.hub_url))
     if args.mock and state.mock_fail:
